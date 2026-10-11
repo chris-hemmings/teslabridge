@@ -34,7 +34,7 @@ section[data-tab].off{display:none}
 #msg{position:fixed;bottom:14px;left:50%;transform:translateX(-50%);background:#222838;border:1px solid var(--line);padding:9px 14px;border-radius:10px;display:none}
 </style></head>
 <body>
-<header><div><h1>AuxLink</h1><div class="sub" id="sub">loading…</div></div></header>
+<header><div><h1>AuxLink <span id="ver" style="font-size:14px;font-weight:normal;opacity:.7"></span></h1><div class="sub" id="sub">loading…</div></div></header>
 <nav class="tabbar" id="tabbar">
   <button data-go="status">Status</button><button data-go="devices">Devices</button><button data-go="settings">Settings</button><button data-go="wifi">Wi-Fi</button><button data-go="login">Pi login</button><button data-go="updates">Updates</button><button data-go="dev">Development</button>
 </nav>
@@ -167,6 +167,7 @@ section[data-tab].off{display:none}
   </section>
 
   <section class="card" data-tab="updates"><h2>Update</h2>
+    <div style="margin-bottom:8px">Installed version: <b id="verUpd">…</b></div>
     <div class="k" style="font-size:13px">Choose an AuxLink zip (the release zip, or the whole-repository download from GitHub) to install it. Settings and pairings are kept; services restart, so a call in progress drops. No internet or reboot needed.</div>
     <label class="f"><span>Zip file</span><input type="file" id="zipFile" accept=".zip,application/zip"></label>
     <div class="btns"><button onclick="upload()">Install update</button></div>
@@ -281,7 +282,7 @@ function renderXiao(){const x=S.xiao||{};
     :'No XIAO on the Pi\'s USB ports';
   $('xiaoFlashFile').disabled=$('xiaoFlashBuiltin').disabled=x.mode!=='update';
   $('xiaoFlashBuiltin').textContent='Flash built-in firmware'+(x.builtin?' ('+x.builtin+')':'')}
-function render(){const c=S.conf;renderXiao();renderTerm();renderTabs();
+function render(){const c=S.conf;$('ver').textContent=S.version?'v'+S.version:'';$('verUpd').textContent=S.version||'unknown';renderXiao();renderTerm();renderTabs();
   // Nothing paired yet: start on the Devices tab (unless a tab was asked for).
   if(firstState){firstState=false;if(!c.CAR&&!ASKED_TAB)showTab('devices')}
   $('sub').textContent=(S.setup_wifi?'Setup Wi-Fi on · ':'')+(c.CAR?'car '+c.CAR:'no car paired yet');

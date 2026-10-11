@@ -26,6 +26,8 @@ echo "Settings kept${added:+; added:$added}"
 install -D -m 644 "$HERE/lib/common.sh" /usr/local/lib/auxlink/common.sh
 install -D -m 644 "$HERE/lib/auxconf.py" /usr/local/lib/auxlink/auxconf.py
 install -D -m 644 "$HERE/share/index.html" /usr/local/share/auxlink/index.html
+# The version shown on the setup page (an update zip without one keeps the old).
+[ -f "$HERE/VERSION" ] && install -D -m 644 "$HERE/VERSION" /usr/local/share/auxlink/VERSION
 install -D -m 644 "$HERE/share/cover-test.jpg" /usr/local/share/auxlink/cover-test.jpg
 printf 'd /run/auxlink 0755 root root -\nf /run/auxlink/events.log 0666 root root -\nd /run/auxlink/outbox 1777 root root -\n' > /etc/tmpfiles.d/auxlink.conf
 systemd-tmpfiles --create /etc/tmpfiles.d/auxlink.conf 2>/dev/null || true

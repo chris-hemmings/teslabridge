@@ -19,6 +19,8 @@ jobs:
       - uses: actions/checkout@v4
       - name: Tools
         run: sudo apt-get update && sudo apt-get install -y parted xz-utils e2fsprogs fdisk zip
+      - name: Version file
+        run: echo "${{ inputs.version }}" > pi/VERSION
       - name: Build the image
         run: sudo AUXLINK_VERSION=${{ inputs.version }} bash pi/image/build-image.sh auxlink-pi-${{ inputs.version }}.img
       - name: Compress

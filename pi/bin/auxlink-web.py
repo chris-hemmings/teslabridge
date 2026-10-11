@@ -183,6 +183,18 @@ def unit_states(user):
     return out
 
 
+def version():
+    """Installed AuxLink version: from the last update (or install), else the image's."""
+    for f in ("/usr/local/share/auxlink/VERSION", "/etc/auxlink-image"):
+        try:
+            v = open(f).read().strip()
+            if v:
+                return v
+        except OSError:
+            pass
+    return "unknown"
+
+
 def state():
     c = auxconf.load()
     user = c.get("AUDIO_USER", "chris")
@@ -219,6 +231,7 @@ def state():
         "services": unit_states(user), "events": events, "setup_wifi": STATE["ap"],
         "home_wifi": home_networks(), "wifi_client": wifi_client_connected(),
         "xiao": xiao_state(),
+        "version": version(),
         "login": {"user": user, "ssh": sh("systemctl", "is-active", "ssh")[1] == "active",
                   "default_password": os.path.exists(DEFAULT_PW_FLAG)},
     }
