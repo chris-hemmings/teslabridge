@@ -64,6 +64,14 @@ for t in serial0 ttyS0 ttyAMA0; do systemctl mask --now "serial-getty@$t.service
 install -D -m 644 "$HERE/etc/captive-portal.conf" /etc/NetworkManager/dnsmasq-shared.d/auxlink-captive.conf
 install -o "$U" -g "$U" -m 644 "$HERE"/systemd/user/*.service "$H/.config/systemd/user/"
 install -o "$U" -g "$U" -m 644 "$HERE"/wireplumber/*.conf "$H/.config/wireplumber/wireplumber.conf.d/"
+# Undo 1.0.66's "never idle-suspend the car" rule (taken back out): remove it
+# and reload WirePlumber once so the running one forgets it.
+if [ -f "$H/.config/wireplumber/wireplumber.conf.d/81-a2dp-keep.conf" ]; then
+  rm -f "$H/.config/wireplumber/wireplumber.conf.d/81-a2dp-keep.conf" \
+        "$H/.config/wireplumber/wireplumber.conf.d/83-auxlink-music-source.conf" \
+        "$H/.local/state/auxlink/a2dp-nosuspend"
+  asuser systemctl --user restart wireplumber >/dev/null 2>&1 || true
+fi
 # Onto the SD card now: a power cut right after an update otherwise leaves
 # freshly written files EMPTY (empty unit files then show as "masked").
 sync
