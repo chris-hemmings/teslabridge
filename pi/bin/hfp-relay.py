@@ -274,6 +274,8 @@ class Relay:
         self.caller_name = ""    # name, when the phone sends one with it
         self.call_info = None    # last written (state, number)
         self.own_pending = 0     # our own commands to the phone after SLC (their OK isn't the car's)
+        self.own_clcc = False    # our own AT+CLCC is out: its +CLCC lines aren't the car's
+        self.clcc_asked = False  # asked once this call
         try:
             self.cmd_seen = os.stat(CALL_CMD_FILE).st_mtime
         except OSError:
@@ -408,6 +410,11 @@ class Relay:
                  else "active" if call else "idle")
         if state == "idle":
             self.caller = self.caller_name = ""
+            self.clcc_asked = False
+        elif state in ("outgoing", "active") and not self.caller and not self.clcc_asked:
+            # No +CLIP for an outgoing call: ask the phone for its call list.
+            self.clcc_asked = True
+            GLib.timeout_add(1500, self.ask_clcc)
         info = (state, self.caller, self.caller_name)
         if info == self.call_info:
             return
@@ -419,6 +426,21 @@ class Relay:
             os.replace(CALL_INFO_FILE + ".tmp", CALL_INFO_FILE)
         except OSError as e:
             log(f"Could not write {CALL_INFO_FILE}: {e}")
+
+    def ask_clcc(self):
+        if self.caller or not (self.phone and self.phone_slc) or self.values.get("callsetup", 0) == 1:
+            return False
+        log("Asking the phone who the call is with -> phone AT+CLCC")
+        self.own_pending += 1
+        self.own_clcc = True
+        self.phone.send("AT+CLCC\r")
+        GLib.timeout_add(3000, self.clcc_timeout)
+        return False
+
+    def clcc_timeout(self):
+        # No answer: never keep holding back the car's own call-list lines.
+        self.own_clcc = False
+        return False
 
     def call_cmd_poll(self):
         """Answer / Decline pressed on the music device (the AuxLink app)."""
@@ -787,8 +809,19 @@ class Relay:
             if (num, name) != (self.caller, self.caller_name):
                 self.caller, self.caller_name = num, name
                 self.write_call_info()
+        if up.startswith("+CLCC:") and '"' in line and (self.own_clcc or not self.caller):
+            # The call list (the car asks for it during calls): the only
+            # place an OUTGOING call's number shows up (no +CLIP for those).
+            # +CLCC: idx,dir,stat,mode,mpty,"number",type[,"name"]
+            f = clip_fields(line.split(":", 1)[1])
+            if len(f) > 5 and f[5]:
+                self.caller, self.caller_name = f[5], (f[7] if len(f) > 7 else "")
+                self.write_call_info()
+        if up.startswith("+CLCC:") and self.own_clcc:
+            return  # the answer to our own AT+CLCC: not the car's
         if self.own_pending and (up in ("OK", "ERROR") or up.startswith("+CME ERROR")):
             self.own_pending -= 1
+            self.own_clcc = False
             return  # the answer to our own ATA / AT+CHUP (the app's buttons)
         # Responses to our own SLC commands stay here.
         if not self.phone_slc:
