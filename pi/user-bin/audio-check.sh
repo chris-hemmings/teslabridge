@@ -66,20 +66,11 @@ elif [ "$ts" = active ]; then ok "stream active"
 else warn "stream is '$ts' (car not taking audio)"; fi
 
 if [ $FIX = yes ]; then
-  echo "7. Restarting the car's stream"
-  # Ask auxlink-audio to pause and start the stream with music in it. Doing
-  # the suspend here as well resumes it under the live loopback, which is the
-  # state the car then stays silent in.
-  req=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-please-heal
-  date +%s > "$req"
-  if systemctl --user is-active --quiet auxlink-audio; then
-    sleep 6
-    ok "done; listen now"
-  else
-    echo "        auxlink-audio is not running; pausing and resuming the car directly"
-    timeout 5 pactl suspend-sink "$SINK" 1; sleep 0.5; timeout 5 pactl suspend-sink "$SINK" 0
-    ok "done; listen now"
-  fi
+  echo "7. Nudging the stream (pause/resume)"
+  timeout 5 pactl suspend-sink "$SINK" 1; sleep 0.5; timeout 5 pactl suspend-sink "$SINK" 0
+  # A suspend silences the loopback's right channel: have auxlink-audio start a fresh one.
+  pkill -f "[n]ode.name=smo_capture"; sleep 3
+  ok "done; listen now"
 fi
 echo
-[ $PROBLEM = no ] && echo "Pi side healthy. If the car is still silent it will be restarted; if it is not within a few seconds: audio-check.sh --fix"
+[ $PROBLEM = no ] && echo "Pi side healthy. Still silent? Car source = Bluetooth/auxlink, car volume, then: audio-check.sh --fix"

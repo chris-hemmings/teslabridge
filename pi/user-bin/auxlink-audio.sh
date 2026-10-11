@@ -8,26 +8,26 @@
 # It behaves like a phone: the car only plays a Bluetooth stream it sees START
 # (AVDTP start) while it is ready and the source says "Playing". A stream that
 # started too early - mid-reconnect, or one that simply ran on through a call -
-# is accepted but stays silent, and so is one the car itself suspended (a
-# chime, a gap) and then found still running. BlueZ keeps reporting "active"
-# and this Pi keeps sending audio. Check and fix works because it pauses and
-# starts that stream again while music is in it.
-#
-# So the stream runs only while the car is ready AND the source says Playing
-# AND there is no call, and every start is two starts: a muted one the car
-# may ignore, then a real one with music, which is the one it plays.
+# is accepted but stays silent. So the stream runs only while the car is
+# ready AND the SMO is playing AND there is no call, and every start is a
+# fresh one (new loopback) with music in it:
 #   * car (re)connects  -> wait until it is ready (HFP set up, or 12 s),
-#                          then the two-step start
-#   * source plays      -> the two-step start (auxlink-media has already told
-#                          the car "Playing" when it writes PLAY_FILE)
-#   * source pauses / call -> stop, and suspend the car output (car sees pause)
-# The car's A2DP sink is never idle-suspended (81-a2dp-keep.conf): a gap must
-# not, by itself, be the suspend the car resumes into silence.
-# If the car suspends the transport anyway, or play is pressed while a stream
-# is already up, the stream is paused and started again with music flowing
-# (the same thing Check and fix does) and a fresh loopback is attached. The
-# sink stays acquired across that swap, so the car keeps the start it just
-# accepted instead of being handed another one.
+#                          then start it like after a call (see below)
+#   * SMO plays         -> start (auxlink-media has already told the car
+#                          "Playing" when it writes PLAY_FILE)
+#   * SMO pauses / call -> stop, and suspend the car output (car sees pause)
+# While streaming, both channels are checked every 60 s: a suspend/resume of
+# the car's output (the car can do that too) leaves a running pw-loopback
+# with a silent RIGHT channel until it is recreated.
+#
+# A car can also accept a stream and play SILENCE with everything on the Pi
+# looking healthy, which nothing here can detect: the Tesla does that to a
+# stream started after a call (seen at 1 s and at 5 s, SBC and SBC-XQ), and
+# plays it after a restart with music flowing. So after a call, music waits
+# call_settle and the stream is then restarted once, 1 s after it starts
+# (the quick version: the mono moment it causes is ~0.3 s). If it is ever silent anyway, pressing play in the car while we stream
+# (auxlink-media writes KICK_FILE) restarts the stream - what "Check and fix"
+# does.
 . /usr/local/lib/auxlink/common.sh
 while [ -z "$CAR" ] || [ -z "$CAR_ADAPTER" ]; do sleep 5; . /etc/auxlink.conf; done
 
@@ -41,26 +41,17 @@ PRESENT_FILE=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-audio-present
 READY_FILE=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-stream-ready
 PRESENT=0; LAST_SOUND=0; NEXT_LEVEL=0
 CAR_SLC_FILE=/run/auxlink/car-slc    # "1" once hfp-relay has the car's HFP set up
-KICK_FILE=/run/auxlink/audio-kick    # touched by auxlink-media when the car presses play,
-                                      # and when playback is told "Playing" again
+KICK_FILE=/run/auxlink/audio-kick    # touched by auxlink-media when the car presses play
 KICK_SEEN=$(stat -c %Y "$KICK_FILE" 2>/dev/null || echo 0)
-# Check and fix (and the app's Fix sound, via the kick file) ask for the same
-# pause/start. This one is writable by the audio user, who runs audio-check.
-HEAL_REQ=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-please-heal
-HEAL_SEEN=$(stat -c %Y "$HEAL_REQ" 2>/dev/null || echo 0)
-# auxlink-media ignores transport drops until this unix time: they are our own
-# pauses. A drop after it is the car letting go, and the stream is restarted.
-HOLD_FILE=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-a2dp-hold
-DROP_FILE=${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/auxlink-a2dp-drop
-DROP_SEEN=$(stat -c %Y "$DROP_FILE" 2>/dev/null || echo 0)
+RECHECK=""        # why the stream is restarted (play pressed in the car)
+RECHECK_AT=0      # when to do it (0 = not pending)
 CALL_ENDED_AT=0; WAS_CALL=0
 # s after a call before the car's stream restarts (the car leaves call
-# mode; the two-step start that follows is what it plays). Separate from the
+# mode; the silent restart that follows covers the rest). Separate from the
 # page's "Resume music after a call", which is when the SOURCE is played
 # again (wired: auxlink-media holds it until this stream runs anyway).
 call_settle() { echo 2; }
-LOOP=""; LOOP_SINK_ID=""; LOOP_INPUT=""; LOOP_STARTED=0; UNLINKED=0; GONE=2; NO_CARD=0
-AFTER_HEAL=0; HEAL_TIMES=""
+LOOP=""; LOOP_SINK_ID=""; LOOP_INPUT=""; LOOP_STARTED=0; UNLINKED=0; GONE=2; NO_CARD=0; NOT_ACTIVE=0; LAST_NUDGE=0
 CONNECTED_AT=0; WAITING_SAID=""; NEXT_STEREO=0; STEREO_BAD=0; STOPPED_FOR=""
 XQ_FAILS=0   # SBC-XQ attempts since this script started (never reset by a disconnect)
 INPUT=""; INPUT_SAID=""
@@ -70,23 +61,14 @@ INPUT=""; INPUT_SAID=""
 # media (e.g. the Oppo's) still mixes into the car's audio as before.
 WP_RULE=${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/83-auxlink-music-source.conf
 wp_rule() {
-  # Keep the car-sink rule in this file too: it is the same key as
-  # 81-a2dp-keep.conf, and a later snippet replaces the array rather than
-  # adding to it.
-  local keep='  {
-    matches = [ { node.name = "~bluez_output.*" } ]
-    actions = { update-props = { session.suspend-timeout-seconds = 0 } }
-  }'
   local want=""
   if [ "${MUSIC_SOURCE:-wired}" = bluetooth ] && [ -n "$SOURCE" ]; then
     want="# Written by auxlink-audio: the music source is an input, not a playback stream.
-# The car sink is never idle-suspended (same rule as 81-a2dp-keep.conf).
 monitor.bluez.rules = [
   {
     matches = [ { node.name = \"~bluez_input.${SOURCE//:/_}.*\" } ]
     actions = { update-props = { bluez5.media-source-role = \"input\", node.autoconnect = false } }
-  },
-$keep
+  }
 ]"
   fi
   local have; have=$(cat "$WP_RULE" 2>/dev/null)
@@ -103,7 +85,7 @@ $keep
 # A phone call, or the car's mic borrowed for voice search (the car is in
 # call mode for that too).
 car_busy() { in_call || [ "$(cat /run/auxlink/mic-active 2>/dev/null)" = 1 ]; }
-stop_loop() { [ -n "$LOOP" ] && kill "$LOOP" 2>/dev/null; LOOP=""; LOOP_SINK_ID=""; AFTER_HEAL=0; }
+stop_loop() { [ -n "$LOOP" ] && kill "$LOOP" 2>/dev/null; LOOP=""; LOOP_SINK_ID=""; }
 linked() {
   local links; links=$(timeout 5 pw-link -l 2>/dev/null)
   echo "$links" | grep -A2 "^$INPUT:capture_FL" | grep -q "smo_capture:" &&
@@ -111,52 +93,20 @@ linked() {
   echo "$links" | grep -A2 "^to_tesla:output_FL" | grep -q "bluez_output" &&
   echo "$links" | grep -A2 "^to_tesla:output_FR" | grep -q "bluez_output"
 }
-# Our own pauses. auxlink-media will not treat the transport leaving "active"
-# as the car letting go until this time.
-hold_a2dp() { echo $(( $(date +%s) + $1 )) > "$HOLD_FILE"; }
-holding() {
-  local until; until=$(cat "$HOLD_FILE" 2>/dev/null || echo 0)
-  [ "$until" -gt "$(date +%s)" ] 2>/dev/null
+# Last resort only (rate-limited): pause/resume the car's stream WITH music
+# flowing (a car whose stream resumes to silence stays silent), then recreate
+# the loopback (the suspend silences its right channel).
+nudge() {
+  timeout 5 pactl suspend-sink "$1" 1; sleep 0.5; timeout 5 pactl suspend-sink "$1" 0
+  sleep 1; stop_loop
 }
-# What Check and fix does, and what actually makes a silent Tesla play:
-# pause and start the stream WHILE MUSIC IS IN IT, then drop the loopback.
-# Resuming into silence is the state the car stays in. Idle-suspend is off,
-# so the transport stays up with no client and the next loopback feeds the
-# start the car just accepted (a brand-new start here is what it ignores).
-# The suspend also silences a running loopback's right channel, which is why
-# the loopback is replaced afterwards.
+# The planned restart: the same pause/resume of the car's stream, done with
+# the music INPUT muted - the car only needs the stream to stop and start
+# again, and the resume's mono side effect (on the old loopback) is then
+# silent. The fresh loopback started next unmutes it: stereo straight away.
+# (The input, not the car output: muting that would change the car's volume.)
 RESTART_MUTED=""
-heal_stream() {
-  # Resuming into silence is the state the car stays in. Caller retries.
-  [ "$PRESENT" = 1 ] || return 1
-  local now recent=0 t kept=""
-  now=$(date +%s)
-  for t in $HEAL_TIMES; do
-    [ $((now - t)) -le 20 ] && recent=$((recent + 1)) && kept="$kept $t"
-  done
-  HEAL_TIMES=$kept
-  if [ "$recent" -ge 4 ]; then
-    echo "Car stream restarted 4 times in 20 s; waiting before trying again"
-    hold_a2dp 15
-    return 1
-  fi
-  HEAL_TIMES="$HEAL_TIMES $now"
-  unmute_input
-  hold_a2dp 8
-  echo "Restarting the car's stream ($2) with music in it"
-  timeout 5 pactl suspend-sink "$1" 1
-  sleep 0.4
-  timeout 5 pactl suspend-sink "$1" 0
-  sleep 0.5
-  stop_loop
-  AFTER_HEAL=1
-}
-# The sacrificial half of a two-step start: pause/resume with the music input
-# muted, so a car that plays the first start plays silence, and the fresh
-# loopback started next is the one it hears. (The input, not the car output:
-# muting that would change the car's volume.)
 quick_restart() {
-  hold_a2dp 8
   timeout 5 pactl set-source-mute "$INPUT" 1 && RESTART_MUTED=$INPUT
   timeout 5 pactl suspend-sink "$1" 1; sleep 0.2; timeout 5 pactl suspend-sink "$1" 0
   sleep 0.2; stop_loop
@@ -167,7 +117,7 @@ start_loop() {
   pw-loopback -c 2 -m '[ FL FR ]' \
               --capture-props="target.object=$INPUT node.name=smo_capture audio.position=[ FL FR ]" \
               --playback-props="target.object=$SINK node.name=to_tesla audio.position=[ FL FR ]" &
-  LOOP=$!; LOOP_SINK_ID=$SINK_ID; LOOP_INPUT=$INPUT; LOOP_STARTED=$(date +%s); UNLINKED=0; STEREO_BAD=0
+  LOOP=$!; LOOP_SINK_ID=$SINK_ID; LOOP_INPUT=$INPUT; LOOP_STARTED=$(date +%s); UNLINKED=0; NOT_ACTIVE=0; STEREO_BAD=0
   NEXT_STEREO=$((LOOP_STARTED + 3))
   echo "Streaming to $SINK"
 }
@@ -218,27 +168,15 @@ stereo_ok() {
 }
 trap 'stop_loop; unmute_input' EXIT
 
-# 81-a2dp-keep.conf is only read when WirePlumber starts. Reload it once
-# after this file is installed, so a gap in the music does not suspend the
-# car (that suspend is the one it resumes into silence).
-KEEP_CONF=${XDG_CONFIG_HOME:-$HOME/.config}/wireplumber/wireplumber.conf.d/81-a2dp-keep.conf
-KEEP_STAMP=${XDG_STATE_HOME:-$HOME/.local/state}/auxlink/a2dp-nosuspend
-if [ -f "$KEEP_CONF" ] && [ ! -f "$KEEP_STAMP" ]; then
-  mkdir -p "$(dirname "$KEEP_STAMP")"
-  echo "Reloading WirePlumber so a gap in the music does not suspend the car"
-  if systemctl --user restart wireplumber; then
-    echo 1 > "$KEEP_STAMP"
-  fi
-  sleep 2
-fi
-
 while true; do
   . /etc/auxlink.conf; CARD=bluez_card.${CAR//:/_}; CAR_RE=${CAR//:/[:_]}
   wp_rule
   # Track the call here, first: a Bluetooth source's stream is closed during
   # a call, and the end must be timed from the call, not from its return.
   if car_busy; then WAS_CALL=1
-  elif [ "$WAS_CALL" = 1 ]; then WAS_CALL=0; CALL_ENDED_AT=$(date +%s); fi
+  elif [ "$WAS_CALL" = 1 ]; then WAS_CALL=0; CALL_ENDED_AT=$(date +%s)
+    RECHECK="the call ended"
+  fi
   # Note: the "xiaoi2s" ALSA device is the Pi<->XIAO hardware I2S link (fixed
   # by the device-tree overlay) and stays present whether or not the SMO
   # itself is plugged into the XIAO's USB-C port - so it is not a reliable
@@ -281,6 +219,10 @@ while true; do
   if [ "$GONE" -ge 2 ]; then
     CONNECTED_AT=$(date +%s); WAITING_SAID=""
     echo "Car connected; waiting until it is ready before starting music"
+    # A car that connects while music already plays can take the first
+    # stream silently, like after a call: start it the same way (a muted
+    # first start, then the real one), so it plays either way.
+    RECHECK="the car just connected"; RECHECK_AT=0
   fi
   GONE=0
 
@@ -331,13 +273,19 @@ while true; do
 
   # ---- should music be streaming right now? ----
   check_sound
+  # Play pressed in the car while we are already streaming: the person hears
+  # nothing, so restart the stream. (Play after a pause starts a fresh
+  # stream anyway - nothing extra then.)
+  kick=$(stat -c %Y "$KICK_FILE" 2>/dev/null || echo 0)
+  if [ "$kick" != "$KICK_SEEN" ]; then
+    KICK_SEEN=$kick
+    [ -n "$LOOP" ] && [ $(( $(date +%s) - LOOP_STARTED )) -ge 3 ] &&
+      { RECHECK="play was pressed in the car"; RECHECK_AT=$(date +%s); }
+  fi
   WHY=""
   if car_busy; then WHY="a call"
   elif [ $(( $(date +%s) - CALL_ENDED_AT )) -lt "$(call_settle)" ]; then WHY="the call just ended"
-  # Paused on its own, even while a tail of sound is still arriving. Leaving
-  # the stream up while the car is told "Paused" is the mute that never
-  # lifts: the car keeps the transport and does not play the next start.
-  elif ! smo_playing; then WHY="the SMO is paused"
+  elif ! smo_playing && [ "$PRESENT" != 1 ]; then WHY="the SMO is paused"
   elif ! car_ready; then WHY="the car is still connecting"
   fi
 
@@ -347,9 +295,8 @@ while true; do
       echo "Stopping the music stream: $WHY"
       stop_loop
       # A phone suspends its stream on pause; the car sees it stop.
-      # hold_a2dp: that suspend is ours, not the car letting go.
       case "$WHY" in "the car is still connecting"|"the call just ended") ;;
-        *) hold_a2dp 8; timeout 5 pactl suspend-sink "$SINK" 1 ;; esac
+        *) timeout 5 pactl suspend-sink "$SINK" 1 ;; esac
     fi
     if [ "$WHY" != "$WAITING_SAID" ]; then
       case "$WHY" in "the car is still connecting"|"the call just ended") ;;
@@ -359,38 +306,6 @@ while true; do
     sleep 0.5; continue
   fi
   WAITING_SAID=""
-
-  now=$(date +%s)
-  # Play in the car, Fix sound, or Check and fix. While a stream is already
-  # up, that means the car has it and is not playing it: pause and start
-  # again with music. While it is down, the start below is that fresh start,
-  # so the request is only remembered as seen.
-  kick=$(stat -c %Y "$KICK_FILE" 2>/dev/null || echo 0)
-  req=$(stat -c %Y "$HEAL_REQ" 2>/dev/null || echo 0)
-  if [ "$kick" != "$KICK_SEEN" ] || [ "$req" != "$HEAL_SEEN" ]; then
-    if [ -n "$LOOP" ] && kill -0 "$LOOP" 2>/dev/null && [ "$PRESENT" = 1 ] &&
-       [ $((now - LOOP_STARTED)) -ge 2 ]; then
-      KICK_SEEN=$kick; HEAL_SEEN=$req
-      heal_stream "$SINK" "play was pressed, or check and fix" && continue
-    elif [ -z "$LOOP" ] || ! kill -0 "$LOOP" 2>/dev/null; then
-      KICK_SEEN=$kick; HEAL_SEEN=$req
-    fi
-  fi
-  # The car suspended the transport (a chime, a gap, its own pause). If it
-  # has already resumed, it resumed a stream it will not play. auxlink-media
-  # records the leave even when it lasted a fraction of a second.
-  drop=$(stat -c %Y "$DROP_FILE" 2>/dev/null || echo 0)
-  hold_until=$(cat "$HOLD_FILE" 2>/dev/null || echo 0)
-  if [ "$drop" != "$DROP_SEEN" ]; then
-    if [ -n "$LOOP" ] && [ "$drop" -gt "$hold_until" ] && ! holding; then
-      if heal_stream "$SINK" "the car suspended the stream"; then
-        DROP_SEEN=$drop
-        continue
-      fi
-    else
-      DROP_SEEN=$drop
-    fi
-  fi
 
   if [ -z "$LOOP" ] || ! kill -0 "$LOOP" 2>/dev/null; then
     # A fresh start every time. Channel layout spelled out on both sides
@@ -402,42 +317,28 @@ while true; do
       echo "Car output was muted; unmuting"
       timeout 5 pactl set-sink-mute "$SINK" 0
     fi
-    if [ "$AFTER_HEAL" = 1 ]; then
-      AFTER_HEAL=0
-      # The transport was just started with music in it. Attach a loopback
-      # only while that start is still up. Suspending here would be a new
-      # start, which is the one the car accepts and then does not play.
-      if [ "$(car_transport_state)" = active ]; then
-        hold_a2dp 4
-        start_loop
-        date +%s > "$READY_FILE"
-        sleep 1; continue
-      fi
-      echo "The restarted stream did not stay open; starting it again"
-    fi
     # Lift a pause-time suspend BEFORE the loopback exists: resuming under a
-    # running loopback is what silences its right channel.
-    hold_a2dp 8
+    # running loopback is what silences its right channel. With nothing
+    # playing yet this starts nothing; the car sees START when the loopback
+    # links, with music in it.
     timeout 5 pactl suspend-sink "$SINK" 0
-    # Two starts, every time. The Tesla sometimes ignores the first and
-    # sometimes plays it; that one carries silence. The second carries the
-    # music, and is the one that gets heard either way.
-    timeout 5 pactl set-source-mute "$INPUT" 1 && RESTART_MUTED=$INPUT
-    start_loop muted
-    for _ in $(seq 20); do linked && break; sleep 0.1; done
-    echo "Second start, so a car that ignored the first one plays this stream"
-    quick_restart "$SINK"
-    # The resume above ran under the muted loopback. Idle-suspend is off, so
-    # killing that loopback does not drop the transport, and the next one
-    # would keep feeding a start that carried silence. Suspend explicitly,
-    # lift it with no client (that starts nothing), then link the music.
-    hold_a2dp 8
-    timeout 5 pactl suspend-sink "$SINK" 1
-    sleep 0.2
-    timeout 5 pactl suspend-sink "$SINK" 0
-    start_loop
-    for _ in $(seq 20); do linked && break; sleep 0.1; done
-    date +%s > "$READY_FILE"     # auxlink-media now plays the source
+    if [ -n "$RECHECK" ] && [ "$RECHECK_AT" = 0 ]; then
+      # After a call the car sometimes ignores this first start and
+      # sometimes plays it. So it carries silence (input muted), is restarted
+      # as soon as it is linked, and only the fresh stream carries the
+      # music: one start heard, in stereo, either way.
+      timeout 5 pactl set-source-mute "$INPUT" 1 && RESTART_MUTED=$INPUT
+      start_loop muted
+      for _ in $(seq 20); do linked && break; sleep 0.1; done
+      echo "Restarting the car's stream once ($RECHECK), so a car that ignored the first start plays it"
+      RECHECK=""
+      quick_restart "$SINK"
+      start_loop
+      for _ in $(seq 20); do linked && break; sleep 0.1; done
+      date +%s > "$READY_FILE"     # auxlink-media now plays the source
+    else
+      start_loop
+    fi
     sleep 1; continue
   fi
 
@@ -451,6 +352,15 @@ while true; do
   fi
   UNLINKED=0
 
+  now=$(date +%s)
+  if [ "$RECHECK_AT" -gt 0 ] && [ "$now" -ge "$RECHECK_AT" ]; then
+    if [ "$PRESENT" = 1 ] || smo_playing; then
+      echo "Restarting the car's stream once ($RECHECK), so a car that took it silently plays it"
+      RECHECK=""; RECHECK_AT=0
+      quick_restart "$SINK"; continue
+    fi
+    RECHECK_AT=$now               # wait for music before restarting
+  fi
   # Both channels really reaching the car? (two bad checks in a row = act)
   if [ "$now" -ge "$NEXT_STEREO" ]; then
     NEXT_STEREO=$((now + 60))
@@ -459,18 +369,24 @@ while true; do
     else
       STEREO_BAD=$((STEREO_BAD + 1))
       if [ "$STEREO_BAD" -ge 2 ]; then
-        heal_stream "$SINK" "the right channel was silent" && continue
-        NEXT_STEREO=$((now + 15))
-      else
-        NEXT_STEREO=$((now + 3))
+        echo "Right channel silent at the car; recreating the loopback"
+        stop_loop; continue
       fi
+      NEXT_STEREO=$((now + 3))
     fi
   fi
 
-  # Backup for a drop the signal missed: the transport is still down.
+  # Last resort: the car's stream is not taking audio at all.
   ts=$(car_transport_state)
-  if [ -n "$ts" ] && [ "$ts" != active ] && ! holding; then
-    heal_stream "$SINK" "the stream is '$ts'" && continue
+  if [ -n "$ts" ] && [ "$ts" != active ]; then
+    NOT_ACTIVE=$((NOT_ACTIVE + 1))
+  else
+    NOT_ACTIVE=0
+  fi
+  if [ "$NOT_ACTIVE" -ge 3 ] && [ $((now - LAST_NUDGE)) -ge 60 ]; then
+    echo "Car stream is '$ts' while we are sending audio; nudging it (last resort)"
+    nudge "$SINK"; LAST_NUDGE=$now; NOT_ACTIVE=0
+    continue
   fi
   sleep 2
 done

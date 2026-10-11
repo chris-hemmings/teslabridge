@@ -526,13 +526,6 @@ class Player(dbus.service.Object):
             "Position": dbus.Int64(self.position_us),
         }, signature="sv"), [])
         self.write_play_state()
-        # Told "Playing" again while a stream may already be up: the car
-        # mutes that stream and does not play it until it sees a new start.
-        # auxlink-audio restarts it (and ignores this if the stream is down,
-        # because it is about to start one).
-        if self.status == "Playing" and getattr(self, "_told_car", None) != "Playing":
-            self.kick_audio()
-        self._told_car = self.status
 
     def effective_state(self):
         if MUSIC_SOURCE == "bluetooth":
@@ -737,8 +730,8 @@ class Player(dbus.service.Object):
     # ---------- steering-wheel buttons ----------
     @staticmethod
     def kick_audio():
-        """The car has a stream it is not playing. auxlink-audio pauses and
-        starts it again with music in it (what "Check and fix" does)."""
+        """Play pressed in the car: auxlink-audio restarts the car's stream once,
+        so a stream the car took silently plays (what "Check and fix" does)."""
         try:
             os.makedirs(os.path.dirname(KICK_FILE), exist_ok=True)
             with open(KICK_FILE, "w") as f:
@@ -1398,53 +1391,9 @@ class AppLink(dbus.service.Object):
         APP_LINK["sock"] = APP_LINK["watch"] = None
 
 
-def watch_car_a2dp(bus):
-    """Remember every time the car's A2DP transport leaves "active".
-
-    The Tesla accepts the resume of a stream that was left running, then does
-    not play it, and the idle can last only a fraction of a second, so polling
-    misses it. auxlink-audio's own pauses write auxlink-a2dp-hold with a unix
-    expiry; those are not the car letting go."""
-    if not PRESENT_FILE:
-        return
-    hold = os.path.join(os.path.dirname(PRESENT_FILE), "auxlink-a2dp-hold")
-    drop = os.path.join(os.path.dirname(PRESENT_FILE), "auxlink-a2dp-drop")
-    last = {"state": None}
-
-    def held():
-        try:
-            return time.time() < float(open(hold).read())
-        except (OSError, ValueError):
-            return False
-
-    def changed(iface, props, invalidated, path=None):
-        if iface != "org.bluez.MediaTransport1" or "State" not in props:
-            return
-        car = load_conf().get("CAR", "").upper().replace(":", "_")
-        if not car or f"/dev_{car}/" not in str(path):
-            return
-        state = str(props["State"])
-        prev, last["state"] = last["state"], state
-        if prev != "active" or state == "active" or held():
-            return
-        try:
-            os.makedirs(os.path.dirname(drop), exist_ok=True)
-            with open(drop, "w") as f:
-                f.write(state)
-            log(f"Car audio transport left active ({state}); the stream will be started again")
-        except OSError as e:
-            log(f"Cannot write {drop}: {e}")
-
-    bus.add_signal_receiver(
-        changed, signal_name="PropertiesChanged",
-        dbus_interface=dbus.PROPERTIES_IFACE, bus_name=BLUEZ,
-        path_keyword="path")
-
-
 def main():
     dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
     bus = dbus.SystemBus()
-    watch_car_a2dp(bus)
     player = Player(bus)
     om = dbus.Interface(bus.get_object(BLUEZ, "/"), "org.freedesktop.DBus.ObjectManager")
     registered = set()
